@@ -1,0 +1,94 @@
+# Pre-training data pipeline configuration.
+# Relative paths are resolved against this file's directory.
+
+pipeline:
+  work_dir: work                 # stage outputs: work/{warc,extracted,deduped,lang_filtered,quality_filtered,metrics}
+  engine: local                  # local | spark  (spark runs dedup + filtering as distributed jobs)
+  num_workers: 4                 # local process pool size (extraction, MinHash signatures)
+  stages: [download, extract, dedup, lang_filter, quality, metrics]
+
+download:
+  crawl: latest                  # e.g. CC-MAIN-2024-33, or "latest" to resolve from index.commoncrawl.org
+  base_url: https://data.commoncrawl.org
+  num_segments: 2                # number of WARC files to fetch from the crawl's warc.paths.gz
+  segment_offset: 0              # skip this many WARC paths (to shard work across machines)
+  # Stream each WARC and keep only the first N records (full files are ~1 GB each).
+  # Set to null to download complete files.
+  max_records_per_segment: 6000
+  timeout_s: 60
+  max_retries: 5
+
+extract:
+  min_text_chars: 200            # drop pages whose extracted main text is shorter
+  max_html_bytes: 2000000        # skip very large HTML payloads
+  favor_precision: true          # trafilatura: stricter boilerplate removal
+  include_tables: false
+  include_comments: false
+
+dedup:
+  exact: true                    # drop exact duplicates (hash of normalized text) first
+  num_perm: 128                  # MinHash permutations
+  threshold: 0.8                 # estimated Jaccard similarity above which docs are near-duplicates
+  ngram_size: 5                  # word shingle size
+  seed: 1
+
+lang_filter:
+  model_path: models/lid.176.bin
+  model_url: https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin
+  target_languages: [en]         # ISO 639 codes as emitted by lid.176 (en, de, fr, es, ...)
+  min_confidence: 0.65
+
+quality:
+  model_path: models/quality_model.bin
+  # Keep documents with P(high quality) >= cutoff. A Wikipedia-vs-web classifier is strict:
+  # 0.3 keeps roughly the top 12-16% of English crawl pages.
+  cutoff: 0.3
+  # Cheap rule-based pre-filters (Gopher-style) applied before the classifier.
+  heuristics:
+    min_words: 50
+    max_words: 100000
+    min_mean_word_length: 3.0
+    max_mean_word_length: 10.0
+    max_symbol_to_word_ratio: 0.1     # '#' and '...' per word
+    max_bullet_line_ratio: 0.9
+    max_ellipsis_line_ratio: 0.3
+    min_alpha_word_ratio: 0.8         # share of words containing a letter
+    max_duplicate_line_ratio: 0.3
+
+quality_training:
+  positives: wikipedia           # "wikipedia" (random English Wikipedia articles) or a JSONL path
+  num_positives: 3000
+  # "commoncrawl": held-out target-language pages from the last segments of the crawl,
+  # so the model never scores its own training negatives. Or a JSONL path.
+  negatives: commoncrawl
+  negative_segments: 8
+  negative_records_per_segment: 6000
+  num_negatives: 3000
+  validation_split: 0.1
+  epochs: 5
+  learning_rate: 0.2
+  word_ngrams: 2
+  dim: 64
+  # Hash buckets for word n-grams. fastText's default (2M) makes a ~500 MB model that every
+  # Spark worker has to load; 200k keeps it ~50 MB with no measurable accuracy loss here.
+  bucket: 200000
+  seed: 42
+
+metrics:
+  ngram_orders: [1, 2, 3, 4]
+  diversity_sample_docs: 5000    # reservoir sample used for distinct-n ratios
+  top_k_domains: 20
+
+spark:
+  master: local[*]               # e.g. yarn, spark://host:7077, k8s://...
+  app_name: pretrain-data-pipeline
+  num_partitions: 64
+  # Domains holding more than this share of documents are salted across several
+  # partitions so one huge site cannot become a straggler partition.
+  hot_domain_share: 0.02
+  max_salt: 16
+  conf:
+    spark.sql.shuffle.partitions: 64
+    spark.serializer: org.apache.spark.serializer.KryoSerializer
+    spark.driver.memory: 4g
+    spark.ui.showConsoleProgress: false

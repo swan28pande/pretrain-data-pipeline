@@ -1,0 +1,6 @@
+.git
+.venv
+work
+models
+dist
+**/__pycache__
